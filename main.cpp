@@ -1,7 +1,10 @@
 #include <errno.h>
 #include <getopt.h>
 #include <netinet/in.h>
+#include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <algorithm>
 #include <cctype>
@@ -11,9 +14,11 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
@@ -27,12 +32,15 @@ namespace nek {
     int port_ = 80;
 
   public:
-    static constexpr int buffer_size = 256;
     socket() = default;
     explicit socket(int port) : port_{port} {
     }
 
     ~socket() {
+      close();
+    }
+
+    void close() noexcept {
       if (accepted_sock_ != 0) {
         ::close(accepted_sock_);
       }
@@ -57,6 +65,8 @@ namespace nek {
       if (::bind(sock_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         throw std::system_error{errno, std::generic_category(), "bind"};
       }
+      int val = 1;
+      ::ioctl(sock_, FIONBIO, &val);
     }
 
     void listen() {
@@ -72,49 +82,53 @@ namespace nek {
       if (sock_ == 0) {
         throw std::logic_error{"socket is not created"};
       }
-      if ((accepted_sock_ = ::accept(sock_, nullptr, nullptr)) < 0) {
+      while ((accepted_sock_ = ::accept(sock_, nullptr, nullptr)) <= 0) {
+        if (errno == EAGAIN) {
+          continue;
+        }
         throw std::system_error{errno, std::generic_category(), "accept"};
       }
     }
 
-    std::vector<char> recv() {
+    auto recv(char* buffer, std::size_t size) {
       if (accepted_sock_ == 0) {
         throw std::logic_error{"socket is not accepted"};
       }
-
-      std::vector<char> response;
-      response.reserve(buffer_size);
-      while (true) {
-        char buf[buffer_size] = {0};
-        auto const recv_size = ::recv(accepted_sock_, buf, sizeof(buf) - 1, 0);
-        if (recv_size == 0) {
-          break;
+      auto const recv_size = ::recv(accepted_sock_, buffer, size, 0);
+      if (recv_size < 0) {
+        if (errno == EAGAIN) {
+          return recv_size;
         }
-        if (recv_size < 0) {
-          throw std::system_error{errno, std::generic_category(), "recv"};
-        }
-        response.insert(response.end(), buf, buf + recv_size);
-        auto const last = response.size();
-        if (response[last - 1] == '\n' && response[last - 2] == '\r' &&
-            response[last - 3] == '\n' && response[last - 4] == '\r') {
-          break;
-        }
-      };
-      response.shrink_to_fit();
-      return response;
+        throw std::system_error{errno, std::generic_category(), "recv"};
+      }
+      return recv_size;
     }
 
-    void send(std::string const& buf) {
-      if (::send(accepted_sock_, buf.c_str(), buf.size(), 0) < 0) {
+    void send(std::string_view buf) {
+      if (::send(accepted_sock_, buf.data(), buf.size(), 0) < 0) {
         throw std::system_error{errno, std::generic_category()};
       }
     }
   };
 
+  enum class parse_state {
+    method,
+    path,
+    query,
+    protocol,
+    http_version,
+    header_key,
+    header_value,
+    body,
+    cr,
+    crlf,
+    crlfcr,
+    done,
+    invalid,
+  };
+
   class request {
-    static constexpr char delimiter[] = "\r\n\r\n";
-    static constexpr char newline[] = "\r\n";
-    std::vector<char> raw_request_;
+    friend class server;
     std::unordered_map<std::string, std::string> headers_;
     std::string method_;
     std::string original_url_;
@@ -123,68 +137,127 @@ namespace nek {
     std::string hostname_;
     std::string body_;
     std::string http_version_;
+    parse_state state_ = parse_state::method;
 
-    void parse() {
-      if (raw_request_.empty()) {
-        return;
-      }
-      auto const headers_end = std::search(raw_request_.begin(), raw_request_.end(), delimiter,
-                                           delimiter + std::size(delimiter) - 1);
-      if (headers_end == raw_request_.end()) {
-        throw std::runtime_error{"there is not delimiter in the raw request"};
-      }
-      // body
-      body_ = std::string{headers_end + std::size(delimiter) - 1, raw_request_.end()};
+    void parse_and_build(char const* buffer, ::ssize_t recv_size) {
+      std::pair<std::string, std::string> header_buffer;
+      for (auto i = 0; i < recv_size; ++i) {
+        auto const it = buffer[i];
 
-      // parse request line
-      auto header_end =
-          std::search(raw_request_.begin(), headers_end, newline, newline + std::size(newline) - 1);
-      std::string request_line{raw_request_.begin(), header_end};
-
-      // parse method
-      auto const method_end = std::find(request_line.begin(), request_line.end(), ' ');
-      method_ = std::string{request_line.begin(), method_end};
-      std::transform(method_.begin(), method_.end(), method_.begin(), ::tolower);
-
-      // parse original_url
-      auto const original_url_end = std::find(method_end + 1, request_line.end(), ' ');
-      original_url_ = std::string{method_end + 1, original_url_end};
-
-      // parse path
-      auto const path_end = std::find(original_url_.begin(), original_url_.end(), '?');
-      path_ = std::string{original_url_.begin(), path_end};
-
-      // parse protocol
-      auto const protocol_end = std::find(original_url_end + 1, request_line.end(), '/');
-      protocol_ = std::string{original_url_end + 1, protocol_end};
-      std::transform(protocol_.begin(), protocol_.end(), protocol_.begin(), ::tolower);
-
-      // parse http version
-      http_version_ = std::string{protocol_end + 1, request_line.end()};
-
-      // parse headers
-      auto header_begin = header_end + 2;
-      while (header_begin < headers_end) {
-        header_end =
-            std::search(header_begin, headers_end, newline, newline + std::size(newline) - 1);
-        auto const key_end = std::find(header_begin, header_end, ':');
-        if (key_end == header_end) {
-          throw std::runtime_error{"key end not found"};
+        switch (state_) {
+          case parse_state::method: {
+            if (it == ' ') {
+              state_ = parse_state::path;
+              break;
+            }
+            method_.push_back(it);
+            break;
+          }
+          case parse_state::path: {
+            if (it == ' ') {
+              state_ = parse_state::protocol;
+              original_url_ = path_ /* + query */;
+              break;
+            }
+            if (it == '?') {
+              state_ = parse_state::query;
+              break;
+            }
+            path_.push_back(it);
+            break;
+          }
+          case parse_state::query: {
+            if (it == ' ') {
+              state_ = parse_state::protocol;
+              original_url_ = path_ /* + query */;
+              break;
+            }
+            // TODO: build query
+            break;
+          }
+          case parse_state::protocol: {
+            if (it == '/') {
+              state_ = parse_state::http_version;
+              break;
+            }
+            protocol_.push_back(it);
+            break;
+          }
+          case parse_state::http_version: {
+            if (it == '\r') {
+              state_ = parse_state::cr;
+              break;
+            }
+            http_version_.push_back(it);
+            break;
+          }
+          case parse_state::header_key: {
+            if (it == ':') {
+              state_ = parse_state::header_value;
+              break;
+            }
+            header_buffer.first.push_back(std::tolower(it));
+            break;
+          }
+          case parse_state::header_value: {
+            // skip when it is first space
+            if (it == ' ' && header_buffer.second.empty()) {
+              break;
+            }
+            if (it == '\r') {
+              headers_.insert(header_buffer);
+              header_buffer.first.clear();
+              header_buffer.second.clear();
+              state_ = parse_state::cr;
+              break;
+            }
+            header_buffer.second.push_back(it);
+            break;
+          }
+          case parse_state::body: {
+            body_.push_back(it);
+            // TODO: if body size is equal to content-length, state
+            break;
+          }
+          case parse_state::cr: {
+            if (it == '\n') {
+              state_ = parse_state::crlf;
+              break;
+            }
+            state_ = parse_state::invalid;
+            break;
+          }
+          case parse_state::crlf: {
+            if (it == '\r') {
+              state_ = parse_state::crlfcr;
+              break;
+            }
+            header_buffer.first.push_back(std::tolower(it));
+            state_ = parse_state::header_key;
+            break;
+          }
+          case parse_state::crlfcr: {
+            if (it == '\n') {
+              state_ = parse_state::done;
+              // TODO: if content-length exists, state transits body. otherwise, state transits
+              // done.
+              break;
+            }
+            state_ = parse_state::invalid;
+            break;
+          }
+          case parse_state::done: {
+            state_ = parse_state::done;
+            break;
+          }
+          default:
+            break;
         }
-        auto const value_begin = key_end + 2;
-        headers_.emplace(std::piecewise_construct, std::forward_as_tuple(header_begin, key_end),
-                         std::forward_as_tuple(value_begin, header_end));
-        header_begin = header_end + 2;
       }
-      auto const& host = headers_["Host"];
-      auto const port_begin = std::find(host.begin(), host.end(), ':');
-      hostname_ = std::string{host.begin(), port_begin};
     }
 
   public:
-    explicit request(std::vector<char> raw_request) : raw_request_{std::move(raw_request)} {
-      parse();
-    }
+    request() = default;
 
     std::unordered_map<std::string, std::string> const& headers() const noexcept {
       return headers_;
@@ -237,11 +310,19 @@ namespace nek {
     }
 
     void set_header(std::string const& header, std::string const& value) {
-      headers_[header] = value;
+      std::string lower_header;
+      lower_header.reserve(header.size());
+      std::transform(header.begin(), header.end(), lower_header.begin(),
+                     [](char c) { return std::tolower(c); });
+      headers_.emplace(lower_header, value);
     }
 
     std::string const& get_header(std::string const& header) const {
-      return headers_.at(header);
+      std::string lower_header;
+      lower_header.reserve(header.size());
+      std::transform(header.begin(), header.end(), lower_header.begin(),
+                     [](char c) { return std::tolower(c); });
+      return headers_.at(lower_header);
     }
 
     response& status(int status) {
@@ -249,12 +330,12 @@ namespace nek {
       return *this;
     }
 
-    response& status_message(std::string message) {
-      status_message_ = std::move(message);
+    response& status_message(std::string_view message) {
+      status_message_ = message;
       return *this;
     }
 
-    void send(std::string const& body) {
+    void send(std::string_view body) {
       auto const message =
           !status_message_.empty() ? status_message_ : default_status_messages[status_];
       std::ostringstream oss;
@@ -263,11 +344,16 @@ namespace nek {
       for (auto const& [header, value] : headers_) {
         oss << header << ": " << value << "\r\n";
       }
-      oss << "Content-Length: " << body.size() << "\r\n";
-      oss << "Content-Type: text/html\r\n";
+      if (!body.empty()) {
+        oss << "Content-Length: " << body.size() << "\r\n";
+        // TODO: deduce content type from body
+        oss << "Content-Type: text/html\r\n";
+      }
       oss << "Connection: Keep-Alive\r\n";
       oss << "\r\n";
-      oss << body;
+      if (!body.empty()) {
+        oss << body;
+      }
       sock_->send(oss.str());
     }
   };
@@ -278,11 +364,6 @@ namespace nek {
       {400, "Bad Request"},
       {404, "Not Found"}};
 
-  request parse(std::vector<char> raw_response) {
-    request req{std::move(raw_response)};
-    return req;
-  }
-
   class server {
     std::thread thread_;
     std::unordered_map<
@@ -291,15 +372,18 @@ namespace nek {
         callbacks_;
 
   public:
-    ~server() {
-      if (thread_.joinable()) {
-        thread_.join();
+    ~server() noexcept {
+      try {
+        if (thread_.joinable()) {
+          thread_.join();
+        }
+      } catch (...) {
       }
     }
 
     template <typename Callback>
-    server& get(std::filesystem::path const& path, Callback&& callback) {
-      callbacks_["get"][path.lexically_normal()] = std::forward<Callback>(callback);
+    server& get(std::string const& path, Callback&& callback) {
+      callbacks_["GET"][path] = std::forward<Callback>(callback);
       return *this;
     }
 
@@ -311,13 +395,27 @@ namespace nek {
           sock.listen();
           while (true) {
             sock.accept();
-            auto const raw_response = sock.recv();
-            auto const req = parse(raw_response);
+            request req;
+            while (true) {
+              char buffer[256] = {0};
+              auto const recv_size = sock.recv(buffer, sizeof(buffer) - 1);
+              if (recv_size == 0) {
+                break;
+              }
+              if (recv_size < 0) {
+                continue;
+              }
+              req.parse_and_build(buffer, recv_size);
+              if (req.state_ == parse_state::done) {
+                // TODO: get hostname from Host header
+                req.hostname_ = "localhost";
+                break;
+              }
+            }
             auto const& target_method_callbacks = callbacks_[req.method()];
             response res{req, sock};
             for (auto const& [path, cb] : target_method_callbacks) {
-              namespace fs = std::filesystem;
-              if (fs::path fspath = path; path == req.path()) {
+              if (std::regex_match(req.path(), std::regex{path})) {
                 cb(req, res);
               }
             }
@@ -363,7 +461,15 @@ int main(int argc, char** argv) {
   nek::server serve;
   serve.get("/", [&html_str](nek::request const& req, nek::response& res) {
     std::cout << req.method() << " " << req.path() << "\n";
-    res.send(html_str);
+    char const* placeholder = "{}";
+    static int count = 0;
+    auto copy = html_str;
+    auto const it = std::search(copy.begin(), copy.end(), placeholder, placeholder + 2);
+    if (it != html_str.end()) {
+      copy.replace(it, it + 2, std::to_string(count));
+      ++count;
+    }
+    res.send(copy);
   });
   serve.listen(3000);
   std::cout << "start server...\n";
